@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fixed Robot URDF Forward Kinematics with POE</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+        }
+        
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+        
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            z-index: 100;
+            max-width: 300px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        
+        #info {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            font-size: 12px;
+            z-index: 100;
+            max-width: 250px;
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+        }
+        
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        input[type="file"] {
+            width: 100%;
+            padding: 8px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            background: white;
+        }
+        
+        .joint-slider {
+            width: 100%;
+            margin: 5px 0;
+        }
+        
+        .joint-value {
+            font-size: 11px;
+            color: #666;
+            text-align: right;
+        }
+        
+        .matrix-display {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 10px;
+            margin-top: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        button {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            margin: 5px 0;
+        }
+        
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        }
+        
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(255, 255, 255, 0.9);
+            padding: 20px;
+            border-radius: 10px;
+            display: none;
+            z-index: 200;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="controls">
+            <div class="control-group">
+                <label for="urdfFile">Load URDF File:</label>
+                <input type="file" id="urdfFile" accept=".urdf,.xml" />
+                <button id="loadSample">Load Sample Robot</button>
+            </div>
+            
+            <div id="jointControls"></div>
+            
+            <div class="control-group">
+                <button id="resetPose">Reset Pose</button>
+                <button id="randomPose">Random Pose</button>
+            </div>
+            
+            <div id="kinematicsDisplay" class="matrix-display">
+                <strong>Forward Kinematics (POE)</strong><br>
+                End-effector transformation will appear here...
+            </div>
+        </div>
+        
+        <div id="info">
+            <strong>Interactive Robot Kinematics</strong><br>
+            • Load URDF files to visualize robots<br>
+            • Adjust joint angles with sliders<br>
+            • Real-time forward kinematics using POE formula<br>
+            • Mouse: Orbit camera<br>
+            • Wheel: Zoom in/out<br>
+            <br>
+            <div id="robotInfo">No robot loaded</div>
+        </div>
+        
+        <div id="loading">Loading robot...</div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        class RobotKinematics {
+            constructor() {
+                this.scene = null;
+                this.camera = null;
+                this.renderer = null;
+                this.robot = null;
+                this.joints = [];
+                this.screwAxes = []; // 螺旋轴 (Screw axes)
+                this.homeConfiguration = null; // M矩阵 - 零位时末端执行器位姿 (Home configuration matrix)
+                this.jointValues = [];
+                this.jointPositions = []; // 存储实际关节位置
+                
+                this.init();
+                this.setupEventListeners();
+            }
+            
+            init() {
+                // Create scene
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x2a2a3a);
+                
+                // Create camera
+                this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+                this.camera.position.set(2, 2, 2);
+                
+                // Create renderer
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.shadowMap.enabled = true;
+                this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+                document.getElementById('container').appendChild(this.renderer.domElement);
+                
+                // Add lights
+                this.setupLighting();
+                
+                // Add grid and axes
+                this.addSceneHelpers();
+                
+                // Setup camera controls
+                this.setupCameraControls();
+                
+                // Start render loop
+                this.animate();
+            }
+            
+            setupLighting() {
+                // Ambient light
+                const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+                this.scene.add(ambientLight);
+                
+                // Directional light
+                const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                directionalLight.position.set(5, 5, 5);
+                directionalLight.castShadow = true;
+                directionalLight.shadow.mapSize.width = 2048;
+                directionalLight.shadow.mapSize.height = 2048;
+                this.scene.add(directionalLight);
+                
+                // Additional fill light
+                const fillLight = new THREE.DirectionalLight(0x4080ff, 0.3);
+                fillLight.position.set(-5, 2, -5);
+                this.scene.add(fillLight);
+            }
+            
+            addSceneHelpers() {
+                // Grid
+                const gridHelper = new THREE.GridHelper(4, 20, 0x888888, 0x444444);
+                this.scene.add(gridHelper);
+                
+                // Coordinate axes
+                const axesHelper = new THREE.AxesHelper(0.5);
+                this.scene.add(axesHelper);
+            }
+            
+            setupCameraControls() {
+                let isMouseDown = false;
+                let mouseX = 0;
+                let mouseY = 0;
+                let targetDistance = 5;
+                let currentDistance = 5;
+                let theta = 0;
+                let phi = Math.PI / 4;
+                
+                const canvas = this.renderer.domElement;
+                
+                canvas.addEventListener('mousedown', (e) => {
+                    isMouseDown = true;
+                    mouseX = e.clientX;
+                    mouseY = e.clientY;
+                });
+                
+                canvas.addEventListener('mousemove', (e) => {
+                    if (!isMouseDown) return;
+                    
+                    const deltaX = e.clientX - mouseX;
+                    const deltaY = e.clientY - mouseY;
+                    
+                    theta += deltaX * 0.01;
+                    phi = Math.max(0.1, Math.min(Math.PI - 0.1, phi + deltaY * 0.01));
+                    
+                    mouseX = e.clientX;
+                    mouseY = e.clientY;
+                    
+                    this.updateCamera();
+                });
+                
+                canvas.addEventListener('mouseup', () => {
+                    isMouseDown = false;
+                });
+                
+                canvas.addEventListener('wheel', (e) => {
+                    targetDistance += e.deltaY * 0.01;
+                    targetDistance = Math.max(1, Math.min(20, targetDistance));
+                    e.preventDefault();
+                });
+                
+                this.updateCamera = () => {
+                    currentDistance += (targetDistance - currentDistance) * 0.1;
+                    
+                    this.camera.position.x = currentDistance * Math.sin(phi) * Math.cos(theta);
+                    this.camera.position.y = currentDistance * Math.cos(phi);
+                    this.camera.position.z = currentDistance * Math.sin(phi) * Math.sin(theta);
+                    
+                    this.camera.lookAt(0, 0, 0);
+                };
+            }
+            
+            setupEventListeners() {
+                document.getElementById('urdfFile').addEventListener('change', (e) => {
+                    const file = e.target.files[0];
+                    if (file) {
+                        this.loadURDFFile(file);
+                    }
+                });
+                
+                document.getElementById('loadSample').addEventListener('click', () => {
+                    this.loadSampleRobot();
+                });
+                
+                document.getElementById('resetPose').addEventListener('click', () => {
+                    this.resetPose();
+                });
+                
+                document.getElementById('randomPose').addEventListener('click', () => {
+                    this.randomPose();
+                });
+                
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                });
+            }
+            
+            loadSampleRobot() {
+                this.createSampleRobot();
+            }
+            
+            createSampleRobot() {
+                // Clear existing robot
+                if (this.robot) {
+                    this.scene.remove(this.robot);
+                }
+                
+                this.robot = new THREE.Group();
+                this.joints = [];
+                this.screwAxes = [];
+                this.jointValues = [];
+                this.jointPositions = [];
+                
+                // 定义机器人参数 (Robot parameters)
+                const linkLengths = [0.3, 0.4, 0.35, 0.3, 0.2, 0.15];
+                const colors = [0xff4444, 0x44ff44, 0x4444ff, 0xffff44, 0xff44ff, 0x44ffff];
+                
+                // Create base
+                const baseGeometry = new THREE.CylinderGeometry(0.1, 0.12, 0.1);
+                const baseMaterial = new THREE.MeshPhongMaterial({ color: 0x888888 });
+                const base = new THREE.Mesh(baseGeometry, baseMaterial);
+                base.position.y = 0.05;
+                this.robot.add(base);
+                
+                // 计算实际关节位置 (Calculate actual joint positions)
+                let cumulativePosition = new THREE.Vector3(0, 0.1, 0); // Start from base top
+                this.jointPositions.push(cumulativePosition.clone());
+                
+                for (let i = 1; i < 6; i++) {
+                    cumulativePosition.y += linkLengths[i-1];
+                    this.jointPositions.push(cumulativePosition.clone());
+                }
+                
+                // 计算末端执行器在零位时的位置 (Calculate end-effector position at home configuration)
+                const endEffectorPosition = cumulativePosition.clone();
+                endEffectorPosition.y += linkLengths[5]; // Add last link length
+                
+                // 设置正确的零位构型 M (Set correct home configuration M)
+                this.homeConfiguration = new THREE.Matrix4().makeTranslation(
+                    endEffectorPosition.x, 
+                    endEffectorPosition.y, 
+                    endEffectorPosition.z
+                );
+                
+                // 为每个关节创建空间螺旋轴 (Create spatial screw axes for each joint)
+                for (let i = 0; i < 6; i++) {
+                    let omega, v;
+                    const q = this.jointPositions[i]; // 关节轴上的点 (Point on joint axis)
+                    
+                    switch (i) {
+                        case 0: // 基座绕Y轴旋转 (Base rotation around Y-axis)
+                            omega = new THREE.Vector3(0, 1, 0);
+                            v = new THREE.Vector3(-q.z, 0, q.x); // -ω × q
+                            break;
+                        case 1: // 肩部绕Z轴旋转 (Shoulder rotation around Z-axis)
+                            omega = new THREE.Vector3(0, 0, 1);
+                            v = new THREE.Vector3(q.y, -q.x, 0); // -ω × q
+                            break;
+                        case 2: // 肘部绕Z轴旋转 (Elbow rotation around Z-axis)
+                            omega = new THREE.Vector3(0, 0, 1);
+                            v = new THREE.Vector3(q.y, -q.x, 0); // -ω × q
+                            break;
+                        case 3: // 腕1绕X轴旋转 (Wrist 1 rotation around X-axis)
+                            omega = new THREE.Vector3(1, 0, 0);
+                            v = new THREE.Vector3(0, q.z, -q.y); // -ω × q
+                            break;
+                        case 4: // 腕2绕Z轴旋转 (Wrist 2 rotation around Z-axis)
+                            omega = new THREE.Vector3(0, 0, 1);
+                            v = new THREE.Vector3(q.y, -q.x, 0); // -ω × q
+                            break;
+                        case 5: // 腕3绕X轴旋转 (Wrist 3 rotation around X-axis)
+                            omega = new THREE.Vector3(1, 0, 0);
+                            v = new THREE.Vector3(0, q.z, -q.y); // -ω × q
+                            break;
+                    }
+                    
+                    this.screwAxes.push({
+                        omega: omega,
+                        v: v,
+                        point: q.clone()
+                    });
+                    
+                    this.jointValues.push(0);
+                }
+                
+                // 创建运动链 (Create kinematic chain)
+                let currentParent = this.robot;
+                
+                for (let i = 0; i < 6; i++) {
+                    // Create joint group
+                    const jointGroup = new THREE.Group();
+                    jointGroup.name = `joint_${i}`;
+                    
+                    // Position joint
+                    jointGroup.position.y = i === 0 ? 0 : linkLengths[i-1];
+                    
+                    // Create joint visualization
+                    const jointGeometry = new THREE.SphereGeometry(0.06);
+                    const jointMaterial = new THREE.MeshPhongMaterial({ color: 0x333333 });
+                    const jointSphere = new THREE.Mesh(jointGeometry, jointMaterial);
+                    jointGroup.add(jointSphere);
+                    
+                    // Create link
+                    const linkGeometry = new THREE.CylinderGeometry(0.04, 0.05, linkLengths[i]);
+                    const linkMaterial = new THREE.MeshPhongMaterial({ color: colors[i] });
+                    const link = new THREE.Mesh(linkGeometry, linkMaterial);
+                    link.position.y = linkLengths[i] / 2;
+                    jointGroup.add(link);
+                    
+                    // Add to parent
+                    currentParent.add(jointGroup);
+                    
+                    // Store joint info
+                    this.joints.push({ 
+                        group: jointGroup, 
+                        sphere: jointSphere, 
+                        link: link, 
+                        index: i 
+                    });
+                    
+                    // Update for next iteration
+                    currentParent = jointGroup;
+                }
+                
+                this.scene.add(this.robot);
+                this.createJointControls();
+                this.updateRobotInfo();
+                this.calculateForwardKinematics();
+            }
+            
+            createJointControls() {
+                const controlsDiv = document.getElementById('jointControls');
+                controlsDiv.innerHTML = '<h4>Joint Controls (关节控制)</h4>';
+                
+                this.jointValues.forEach((value, index) => {
+                    const jointDiv = document.createElement('div');
+                    jointDiv.className = 'control-group';
+                    
+                    const label = document.createElement('label');
+                    label.textContent = `Joint ${index + 1} (关节${index + 1}):`;
+                    
+                    const slider = document.createElement('input');
+                    slider.type = 'range';
+                    slider.className = 'joint-slider';
+                    slider.min = '-3.14';
+                    slider.max = '3.14';
+                    slider.step = '0.01';
+                    slider.value = '0';
+                    
+                    const valueDisplay = document.createElement('div');
+                    valueDisplay.className = 'joint-value';
+                    valueDisplay.textContent = '0.00 rad';
+                    
+                    slider.addEventListener('input', (e) => {
+                        const value = parseFloat(e.target.value);
+                        this.jointValues[index] = value;
+                        valueDisplay.textContent = `${value.toFixed(2)} rad`;
+                        this.updateRobotPose();
+                        this.calculateForwardKinematics();
+                    });
+                    
+                    jointDiv.appendChild(label);
+                    jointDiv.appendChild(slider);
+                    jointDiv.appendChild(valueDisplay);
+                    controlsDiv.appendChild(jointDiv);
+                });
+            }
+            
+            updateRobotPose() {
+                // 应用关节角度到3D模型 (Apply joint angles to 3D model)
+                this.joints.forEach((joint, index) => {
+                    const angle = this.jointValues[index];
+                    const screwAxis = this.screwAxes[index];
+                    
+                    // Reset rotation
+                    joint.group.rotation.set(0, 0, 0);
+                    
+                    // Apply rotation based on omega direction
+                    const omega = screwAxis.omega;
+                    if (Math.abs(omega.x) > 0.5) {
+                        joint.group.rotation.x = angle;
+                    } else if (Math.abs(omega.y) > 0.5) {
+                        joint.group.rotation.y = angle;
+                    } else if (Math.abs(omega.z) > 0.5) {
+                        joint.group.rotation.z = angle;
+                    }
+                });
+            }
+            
+            calculateForwardKinematics() {
+                // POE公式: T = exp([S₁]θ₁) exp([S₂]θ₂) ... exp([Sₙ]θₙ) M
+                // (Product of Exponentials formula)
+                
+                let result = new THREE.Matrix4().identity();
+                
+                // 顺序计算每个关节变换 (Calculate each joint transformation in sequence)
+                for (let i = 0; i < this.screwAxes.length; i++) {
+                    const screwAxis = this.screwAxes[i];
+                    const angle = this.jointValues[i];
+                    
+                    // 计算螺旋轴的矩阵指数 (Calculate matrix exponential of screw axis)
+                    const expMatrix = this.matrixExponentialSE3(screwAxis, angle);
+                    result.multiplyMatrices(result, expMatrix);
+                }
+                
+                // 应用零位构型 (Apply home configuration)
+                result.multiplyMatrices(result, this.homeConfiguration);
+                
+                this.displayKinematicsResult(result);
+                this.visualizeEndEffector(result);
+                
+                // 调试信息：显示计算过程
+                this.debugKinematics(result);
+            }
+            
+            matrixExponentialSE3(screwAxis, angle) {
+                // 计算SE(3)的矩阵指数 exp([S]θ)
+                // (Calculate matrix exponential for SE(3))
+                
+                const omega = screwAxis.omega.clone();
+                const v = screwAxis.v.clone();
+                
+                if (Math.abs(angle) < 1e-6) {
+                    return new THREE.Matrix4().identity();
+                }
+                
+                const omegaNorm = omega.length();
+                
+                if (omegaNorm < 1e-6) {
+                    // 纯平移 (Pure translation)
+                    const result = new THREE.Matrix4().identity();
+                    result.setPosition(v.multiplyScalar(angle));
+                    return result;
+                }
+                
+                // 归一化角速度 (Normalize angular velocity)
+                const omegaHat = omega.clone().divideScalar(omegaNorm);
+                const theta = angle * omegaNorm;
+                
+                // Rodrigues公式计算旋转矩阵 (Rodrigues' formula for rotation matrix)
+                // R = I + sin(θ)[ω̂] + (1-cos(θ))[ω̂]²
+                const cosTheta = Math.cos(theta);
+                const sinTheta = Math.sin(theta);
+                const oneMinusCos = 1 - cosTheta;
+                
+                const wx = omegaHat.x;
+                const wy = omegaHat.y;
+                const wz = omegaHat.z;
+                
+                // 构建旋转矩阵 (Construct rotation matrix)
+                const R = new THREE.Matrix3();
+                R.set(
+                    cosTheta + wx*wx*oneMinusCos,     wx*wy*oneMinusCos - wz*sinTheta,  wx*wz*oneMinusCos + wy*sinTheta,
+                    wy*wx*oneMinusCos + wz*sinTheta, cosTheta + wy*wy*oneMinusCos,     wy*wz*oneMinusCos - wx*sinTheta,
+                    wz*wx*oneMinusCos - wy*sinTheta, wz*wy*oneMinusCos + wx*sinTheta,  cosTheta + wz*wz*oneMinusCos
+                );
+                
+                // 计算平移部分 (Calculate translation part)
+                // V = (I*θ + (1-cos(θ))[ω̂] + (θ-sin(θ))[ω̂]²) / θ
+                let p = new THREE.Vector3();
+                
+                if (v.length() > 1e-6) {
+                    const identityCoeff = sinTheta / theta;
+                    const skewCoeff = oneMinusCos / theta;
+                    const skewSquaredCoeff = (theta - sinTheta) / theta;
+                    
+                    // 直接计算 V * v，其中 V 是积分矩阵
+                    // V * v = v * (sin(θ)/θ) + ω̂ × v * ((1-cos(θ))/θ) + ω̂ × (ω̂ × v) * ((θ-sin(θ))/θ)
+                    const term1 = v.clone().multiplyScalar(identityCoeff);
+                    const term2 = new THREE.Vector3().crossVectors(omegaHat, v).multiplyScalar(skewCoeff);
+                    const omegaCrossV = new THREE.Vector3().crossVectors(omegaHat, v);
+                    const term3 = new THREE.Vector3().crossVectors(omegaHat, omegaCrossV).multiplyScalar(skewSquaredCoeff);
+                    
+                    p.addVectors(term1, term2).add(term3);
+                }
+                
+                // 构建4x4变换矩阵 (Construct 4x4 transformation matrix)
+                const result = new THREE.Matrix4();
+                const m = result.elements;
+                
+                // 设置旋转和平移部分 (Set rotation and translation parts)
+                m[0] = R.elements[0]; m[4] = R.elements[3]; m[8] = R.elements[6];   m[12] = p.x;
+                m[1] = R.elements[1]; m[5] = R.elements[4]; m[9] = R.elements[7];   m[13] = p.y;
+                m[2] = R.elements[2]; m[6] = R.elements[5]; m[10] = R.elements[8];  m[14] = p.z;
+                m[3] = 0;             m[7] = 0;             m[11] = 0;              m[15] = 1;
+                
+                return result;
+            }
+            
+            debugKinematics(finalResult) {
+                // 输出调试信息到控制台
+                console.log('=== Forward Kinematics Debug ===');
+                console.log('Joint values:', this.jointValues);
+                console.log('Home configuration M:', this.homeConfiguration);
+                console.log('Final result T:', finalResult);
+                
+                // 验证：提取最终位置
+                const position = new THREE.Vector3();
+                finalResult.extractPosition(position);
+                console.log('Final TCP position:', position);
+            }
+            
+            displayKinematicsResult(matrix) {
+                const display = document.getElementById('kinematicsDisplay');
+                
+                // 提取位置和姿态 (Extract position and orientation)
+                const position = new THREE.Vector3();
+                const quaternion = new THREE.Quaternion();
+                const scale = new THREE.Vector3();
+                matrix.decompose(position, quaternion, scale);
+                
+                // 转换为欧拉角 (Convert to Euler angles)
+                const euler = new THREE.Euler().setFromQuaternion(quaternion);
+                
+                display.innerHTML = `
+                    <strong>正运动学 (Forward Kinematics - POE)</strong><br>
+                    <strong>位置 Position (TCP):</strong><br>
+                    X: ${position.x.toFixed(3)}<br>
+                    Y: ${position.y.toFixed(3)}<br>
+                    Z: ${position.z.toFixed(3)}<br>
+                    <strong>姿态 Orientation (Euler):</strong><br>
+                    Roll: ${euler.x.toFixed(3)} rad<br>
+                    Pitch: ${euler.y.toFixed(3)} rad<br>
+                    Yaw: ${euler.z.toFixed(3)} rad<br>
+                    <strong>变换矩阵 Transformation Matrix:</strong><br>
+                    <pre style="font-size: 8px; margin: 5px 0;">${this.formatMatrix(matrix)}</pre>
+                `;
+            }
+            
+            formatMatrix(matrix) {
+                const m = matrix.elements;
+                return `[${m[0].toFixed(2)} ${m[4].toFixed(2)} ${m[8].toFixed(2)} ${m[12].toFixed(2)}]
+[${m[1].toFixed(2)} ${m[5].toFixed(2)} ${m[9].toFixed(2)} ${m[13].toFixed(2)}]
+[${m[2].toFixed(2)} ${m[6].toFixed(2)} ${m[10].toFixed(2)} ${m[14].toFixed(2)}]
+[${m[3].toFixed(2)} ${m[7].toFixed(2)} ${m[11].toFixed(2)} ${m[15].toFixed(2)}]`;
+            }
+            
+            visualizeEndEffector(matrix) {
+                // 移除现有的末端执行器可视化 (Remove existing end-effector visualization)
+                const existing = this.scene.getObjectByName('end-effector');
+                if (existing) {
+                    this.scene.remove(existing);
+                }
+                
+                // 创建末端执行器可视化 (Create end-effector visualization)
+                const endEffector = new THREE.Group();
+                endEffector.name = 'end-effector';
+                
+                // 末端坐标系 (End-effector coordinate frame)
+                const axesHelper = new THREE.AxesHelper(0.2);
+                endEffector.add(axesHelper);
+                
+                // 末端球体 - 更大更明显 (End-effector sphere - larger and more visible)
+                const sphereGeometry = new THREE.SphereGeometry(0.05);
+                const sphereMaterial = new THREE.MeshPhongMaterial({ 
+                    color: 0xff0000,
+                    emissive: 0x330000
+                });
+				const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+                endEffector.add(sphere);
+                
+                // 应用变换 (Apply transformation)
+                endEffector.applyMatrix4(matrix);
+                
+                this.scene.add(endEffector);
+            }
+            
+            updateRobotInfo() {
+                const info = document.getElementById('robotInfo');
+                info.innerHTML = `
+                    <strong>示例6自由度机器人 (Sample 6-DOF Robot)</strong><br>
+                    关节数 Joints: ${this.joints.length}<br>
+                    自由度 DOF: ${this.jointValues.length}<br>
+                    运动学 Kinematics: POE Formula
+                `;
+            }
+            
+            resetPose() {
+                this.jointValues.fill(0);
+                this.updateSliders();
+                this.updateRobotPose();
+                this.calculateForwardKinematics();
+            }
+            
+            randomPose() {
+                this.jointValues = this.jointValues.map(() => (Math.random() - 0.5) * Math.PI);
+                this.updateSliders();
+                this.updateRobotPose();
+                this.calculateForwardKinematics();
+            }
+            
+            updateSliders() {
+                const sliders = document.querySelectorAll('.joint-slider');
+                const displays = document.querySelectorAll('.joint-value');
+                
+                sliders.forEach((slider, index) => {
+                    slider.value = this.jointValues[index];
+                    displays[index].textContent = `${this.jointValues[index].toFixed(2)} rad`;
+                });
+            }
+            
+            loadURDFFile(file) {
+                // This is a placeholder for URDF file loading
+                // In a real implementation, you would parse the URDF XML
+                // and extract joint information, link geometries, etc.
+                alert('URDF file loading would be implemented here. For now, use the sample robot.');
+            }
+            
+            animate() {
+                requestAnimationFrame(() => this.animate());
+                
+                if (this.updateCamera) {
+                    this.updateCamera();
+                }
+                
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+        
+        // Initialize the application
+        const robotKinematics = new RobotKinematics();
+    </script>
+</body>
+</html>
